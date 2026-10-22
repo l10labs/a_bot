@@ -1,13 +1,8 @@
 //! Gamma discovery and CLOB best-bid/ask collection for rolling crypto markets.
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Context;
-use futures::{StreamExt, stream::BoxStream};
 use polymarket_client_sdk_v2::{
-    clob::ws::{
-        Client as WsClient,
-        types::response::{BestBidAsk, BookUpdate, LastTradePrice, MarketResolved, PriceChange},
-    },
     gamma::{
         Client as GammaClient,
         types::{request::MarketsRequest, response::Market},
@@ -15,9 +10,8 @@ use polymarket_client_sdk_v2::{
     types::U256,
 };
 use sqlx::SqlitePool;
-use tokio::sync::{mpsc, watch};
 
-use crate::{Write, now_ms};
+use crate::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timeframe {
@@ -182,7 +176,7 @@ fn tokens(market: Market, now: i64) -> Option<Vec<Arc<Token>>> {
     )
 }
 
-async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U256, Arc<Token>>> {
+pub(crate) async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U256, Arc<Token>>> {
     let now = chrono::Utc::now();
     let mut result = BTreeMap::new();
     let mut offset = 0;
@@ -216,189 +210,6 @@ async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U256, Arc<Tok
     Ok(result)
 }
 
-enum Wire {
-    Quote(BestBidAsk),
-    Book(BookUpdate),
-    Change(PriceChange),
-    Trade(LastTradePrice),
-    Resolution(MarketResolved),
-}
-
-fn subscribe(
-    ws: &WsClient,
-    ids: Vec<U256>,
-) -> anyhow::Result<BoxStream<'static, polymarket_client_sdk_v2::Result<Wire>>> {
-    if ids.is_empty() {
-        return Ok(Box::pin(futures::stream::pending()));
-    }
-    let streams: Vec<BoxStream<'static, _>> = vec![
-        ws.subscribe_best_bid_ask(ids.clone())?
-            .map(|r| r.map(Wire::Quote))
-            .boxed(),
-        ws.subscribe_orderbook(ids.clone())?
-            .map(|r| r.map(Wire::Book))
-            .boxed(),
-        ws.subscribe_prices(ids.clone())?
-            .map(|r| r.map(Wire::Change))
-            .boxed(),
-        ws.subscribe_last_trade_price(ids.clone())?
-            .map(|r| r.map(Wire::Trade))
-            .boxed(),
-        ws.subscribe_market_resolutions(ids)?
-            .map(|r| r.map(Wire::Resolution))
-            .boxed(),
-    ];
-    Ok(futures::stream::select_all(streams).boxed())
-}
-
-pub async fn run(
-    tx: mpsc::Sender<Write>,
-    mut shutdown: watch::Receiver<bool>,
-    pool: SqlitePool,
-) -> anyhow::Result<()> {
-    let (discovery_tx, mut discovery_rx) =
-        watch::channel((BTreeMap::new(), std::collections::BTreeSet::new()));
-    let discovery_pool = pool.clone();
-    // Discovery must not block consuming quotes while HTTP requests are in flight.
-    let discovery = tokio::spawn(async move {
-        let gamma = GammaClient::default();
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            match discover(&gamma).await {
-                Ok(tokens) => match crate::market_data::pending(&discovery_pool).await {
-                    Ok(pending) => {
-                        let pending = pending.into_iter().map(|t| t.market_id.clone()).collect();
-                        if discovery_tx.send((tokens, pending)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => eprintln!("Pending-resolution refresh failed: {error:#}"),
-                },
-                Err(error) => eprintln!("Gamma discovery failed (retrying): {error:#}"),
-            }
-        }
-    });
-    let mut reconcile = tokio::spawn(crate::market_data::reconcile(pool.clone(), tx.clone()));
-    let result = async {
-        let ws = WsClient::default();
-        // Restore unresolved markets after restart; retain their subscriptions after expiry.
-        let mut known: BTreeMap<U256, Arc<Token>> = crate::market_data::pending(&pool).await?
-            .into_iter().map(|t| (t.token_id,t)).collect();
-        let mut quotes = subscribe(&ws, known.keys().copied().collect())?;
-        let mut resolved = std::collections::BTreeSet::new();
-        let mut activated: std::collections::BTreeSet<U256> = known.values()
-            .filter(|t| t.start_ms <= now_ms() && now_ms() < t.end_ms).map(|t| t.token_id).collect();
-        let mut activation = tokio::time::interval(Duration::from_secs(1));
-        activation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => return Ok(()),
-                result = &mut reconcile => {
-                    result.context("resolution reconciliation task panicked")??;
-                    anyhow::bail!("resolution reconciliation task stopped unexpectedly");
-                }
-                _ = activation.tick() => {
-                    let now = now_ms();
-                    let active: std::collections::BTreeSet<_> = known.values()
-                        .filter(|t| t.start_ms <= now && now < t.end_ms).map(|t| t.token_id).collect();
-                    if active.difference(&activated).next().is_some() {
-                        // Refresh initial depth after the window opens, rather than persisting
-                        // the pre-window snapshot sent when we first subscribed ahead of time.
-                        let ids = known.keys().copied().collect::<Vec<_>>();
-                        if !ids.is_empty() {
-                            for _ in 0..5 { ws.unsubscribe_orderbook(&ids)?; }
-                            quotes = subscribe(&ws, ids)?;
-                        }
-                    }
-                    activated = active;
-                }
-                changed = discovery_rx.changed() => {
-                    changed.context("Gamma discovery task stopped")?;
-                    let (mut next, pending) = discovery_rx.borrow_and_update().clone();
-                    for (id, token) in &known {
-                        if !resolved.contains(&token.market_id) && (token.end_ms > now_ms() || pending.contains(&token.market_id)) {
-                            next.entry(*id).or_insert_with(|| token.clone());
-                        }
-                    }
-                    next.retain(|_, token| !resolved.contains(&token.market_id));
-                    if known.keys().eq(next.keys()) { continue; }
-                    let ids = next.keys().copied().collect::<Vec<_>>();
-                    if !known.is_empty() {
-                        // Each of the five typed streams owns one subscription reference.
-                        for _ in 0..5 {
-                            ws.unsubscribe_orderbook(&known.keys().copied().collect::<Vec<_>>())?;
-                        }
-                    }
-                    eprintln!("Gamma: tracking {} crypto Up/Down markets (5m/15m/1h/4h) ({} tokens)", next.len()/2, next.len());
-                    quotes = subscribe(&ws, ids)?;
-                    known = next;
-                    let now = now_ms();
-                    activated = known.values().filter(|t| t.start_ms <= now && now < t.end_ms).map(|t| t.token_id).collect();
-                }
-                update = quotes.next() => match update {
-                    Some(Ok(Wire::Quote(quote))) => {
-                        if let Some(token) = known.get(&quote.asset_id) {
-                            let received_ms = now_ms();
-                            if !in_active_window(token, quote.timestamp, received_ms) { continue; }
-                            tx.send(Write::Quote(Quote {
-                                token: token.clone(), bid: quote.best_bid.to_string(), ask: quote.best_ask.to_string(),
-                                timestamp_ms: quote.timestamp, received_ms,
-                            })).await.context("writer queue closed")?;
-                        }
-                    }
-                    Some(Ok(event)) => {
-                        use crate::market_data::{Data, Record};
-                        let received_ms = now_ms();
-                        let mut records = Vec::new();
-                        match event {
-                            Wire::Book(book) => if let Some(token) = known.get(&book.asset_id) {
-                                records.push(Record { token:token.clone(), received_ms, data:Data::Book(book) });
-                            },
-                            Wire::Trade(trade) => if let Some(token) = known.get(&trade.asset_id) {
-                                records.push(Record { token:token.clone(), received_ms, data:Data::Trade(trade) });
-                            },
-                            Wire::Change(change) => for entry in change.price_changes {
-                                if let Some(token) = known.get(&entry.asset_id) {
-                                    records.push(Record { token:token.clone(), received_ms, data:Data::Change { timestamp_ms:change.timestamp, entry } });
-                                }
-                            },
-                            Wire::Resolution(result) => if let Some(token) = known.get(&result.winning_asset_id) {
-                                if token.end_ms <= received_ms && result.market.to_string() == token.condition_id
-                                    && result.winning_outcome.eq_ignore_ascii_case(&token.outcome) {
-                                    resolved.insert(token.market_id.clone());
-                                    records.push(Record { token:token.clone(), received_ms, data:Data::Resolution {
-                                        winning_token:result.winning_asset_id, outcome:result.winning_outcome.to_ascii_lowercase(),
-                                        timestamp_ms:result.timestamp, source:"clob_ws".into(),
-                                    }});
-                                }
-                            },
-                            Wire::Quote(_) => unreachable!(),
-                        }
-                        for record in records {
-                            if record.eligible() {
-                                tx.send(Write::MarketData(record)).await.context("writer queue closed")?;
-                            }
-                        }
-                    }
-                    Some(Err(error)) => eprintln!("CLOB stream error (possible data gap): {error}"),
-                    None => anyhow::bail!("CLOB quote stream ended unexpectedly"),
-                }
-            }
-        }
-    }.await;
-    discovery.abort();
-    let _ = discovery.await;
-    reconcile.abort();
-    // Its join result may already have been consumed in the select above.
-    if !reconcile.is_finished() {
-        let _ = reconcile.await;
-    }
-    result
-}
-
 pub async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     for timeframe in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::H4] {
         let frame = timeframe.name();
@@ -424,6 +235,8 @@ pub async fn store_batch(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<(
     let mut prepared_tokens = std::collections::BTreeSet::new();
     let mut prepared_tables = std::collections::BTreeSet::new();
     let mut prepared_data = std::collections::BTreeSet::new();
+    let mut quote_rows: BTreeMap<String, Vec<&Quote>> = BTreeMap::new();
+    let mut bulk_rows: BTreeMap<(String, &str), Vec<&crate::market_data::Record>> = BTreeMap::new();
     for write in batch {
         let (token, quote, data) = match write {
             Write::Quote(quote)
@@ -471,9 +284,7 @@ pub async fn store_batch(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<(
             .bind(&token.asset).bind(&table).execute(&mut *tx).await?;
         }
         if let Some(quote) = quote {
-            sqlx::query(&format!("INSERT INTO {table}(token_id,timestamp_ms,received_ms,best_bid,best_ask) VALUES (?,?,?,?,?)"))
-                .bind(token.token_id.to_string()).bind(quote.timestamp_ms).bind(quote.received_ms)
-                .bind(&quote.bid).bind(&quote.ask).execute(&mut *tx).await?;
+            quote_rows.entry(table.clone()).or_default().push(quote);
             *counts
                 .entry(format!("{}:{frame}", token.asset))
                 .or_insert(0usize) += 1;
@@ -486,21 +297,54 @@ pub async fn store_batch(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<(
                 crate::market_data::Data::Resolution { .. } => "resolutions",
             };
             let initialize = prepared_data.insert((table.clone(), kind));
-            crate::market_data::store(&mut tx, record, initialize).await?;
+            if !initialize
+                && matches!(
+                    record.data,
+                    crate::market_data::Data::Change { .. } | crate::market_data::Data::Trade(_)
+                )
+            {
+                bulk_rows
+                    .entry((table.clone(), kind))
+                    .or_default()
+                    .push(record);
+            } else {
+                crate::market_data::store(&mut tx, record, initialize).await?;
+            }
             *counts
                 .entry(format!("{}:{frame}:{kind}", token.asset))
                 .or_insert(0usize) += 1;
         }
     }
+    for (table, rows) in quote_rows {
+        for chunk in rows.chunks(150) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+                "INSERT INTO {table}(token_id,timestamp_ms,received_ms,best_bid,best_ask) "
+            ));
+            query.push_values(chunk.iter(), |mut row, quote| {
+                row.push_bind(quote.token.token_id.to_string())
+                    .push_bind(quote.timestamp_ms)
+                    .push_bind(quote.received_ms)
+                    .push_bind(quote.bid.as_str())
+                    .push_bind(quote.ask.as_str());
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+    }
+    for rows in bulk_rows.values() {
+        crate::market_data::bulk_store(&mut tx, rows).await?;
+    }
     tx.commit().await?;
     if !counts.is_empty() {
-        println!(
-            "Wrote CLOB data: {}",
-            counts
-                .iter()
-                .map(|(asset, n)| format!("{asset}={n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+        crate::console::debug(
+            "CLOB",
+            format!(
+                "{}",
+                counts
+                    .iter()
+                    .map(|(asset, n)| format!("{asset}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         );
     }
     Ok(())

@@ -1,6 +1,6 @@
 # a_bot
 
-Streams every Binance and Chainlink price available through Polymarket RTDS, without symbol filters. A dedicated writer thread commits queued updates in one transaction every second. After each nonempty commit, prints the number of prices, distinct assets, per-feed/symbol counts, and write duration instead of individual ticks.
+Streams every Binance and Chainlink price available through Polymarket RTDS, without symbol filters. A dedicated SQLite writer batches queued updates every second (or sooner at 8,192 records). After each nonempty batch, prints one aligned summary with record counts by type, write duration, and queue depth. Detailed per-asset counts are available at debug level.
 
 ```sh
 cargo run
@@ -33,8 +33,8 @@ The SDK reconnects automatically, but this is a live feed, not a historical back
 - 5m/15m/4h markets use `<asset>-updown-<duration>-<start-seconds>` slugs; hourly markets use descriptive slugs such as `bitcoin-up-or-down-october-22-2026-12am-et`. Hourly windows are validated as exactly one hour using Gamma `eventStartTime`/`endDate`, with the crypto symbol derived from the Binance pair in the description. `startDate` is a listing date and is not used as the trading-window start. Timestamp slugs are cross-checked against Gamma's timing fields where present, and ET-aligned 4h windows are supported.
 - Discovers assets dynamically, validates Up/Down outcomes, and maps each outcome to its Gamma token ID. Tracks current and upcoming windows and refreshes subscriptions as windows roll over. Discovery/subscriptions retain the 15-minute lookahead, but persistence requires both the source timestamp and captured receipt timestamp to be within `[start_ms, end_ms)`. Metadata and per-asset tables are created with the first eligible quote/book/change/trade, never for upcoming windows alone. A final batch can commit after close if its ticks arrived during the active window. Existing history is not retroactively deleted.
 - Subscribes to best bid/ask, full order-book snapshots, price-level changes, public last-trade events, and market resolutions. Best bid/ask and resolution subscriptions enable the SDK's custom features. Quotes are change events, not periodic samples.
-- At active-window transitions, refreshes subscriptions to request a fresh initial book; pre-window snapshots are not stored. Book levels preserve wire order and exact decimal price/size. Changes with size zero remove that price level; missing size remains NULL, not zero.
-- Public `last_trade_price` is the library's live public execution feed, not authenticated user trades. Every received eligible tick is retained, including repeats; the SDK does not supply an execution ID for reliable deduplication. This is not a guaranteed complete historical trade tape. Disconnects, SDK broadcast lag, and subscription refreshes can cause gaps. SDK warnings are enabled (`RUST_LOG=warn` by default); snapshots re-anchor depth after refresh/reconnect. There is no sequence-number guarantee for reconstructing an uninterrupted book.
+- At active-window transitions, refreshes only the opening market's subscription to request a fresh initial book; unrelated market subscriptions remain untouched. Pre-window snapshots are not stored. Book levels preserve wire order and exact decimal price/size. Changes with size zero remove that price level; missing size remains NULL, not zero.
+- Public `last_trade_price` is the library's live public execution feed, not authenticated user trades. Every received eligible tick is retained, including repeats; the SDK does not supply an execution ID for reliable deduplication. This is not a guaranteed complete historical trade tape. Disconnects, SDK broadcast lag, and subscription refreshes can cause gaps. SDK warnings are enabled (SDK level `warn` by default); snapshots re-anchor depth after refresh/reconnect. There is no sequence-number guarantee for reconstructing an uninterrupted book.
 - Discovery runs separately from event consumption, retries HTTP errors, and preserves subscriptions on discovery failures. The SDK handles WebSocket reconnects.
 - Expired unresolved markets retain subscriptions. Resolution events are explicitly exempt from active-window filtering and must match the tracked winning token/outcome/condition. Every 60 seconds, reconciliation polls Gamma for persisted expired unresolved markets, accepting only `closed=true`, UMA status `resolved`, and an exact 1/0 payout pair. It does not guess a winner from near-1 prices or assume expiry means resolution. Persisted pending markets are restored on restart. Gamma-fallback `timestamp_ms` is the observation time, not an invented resolution-event time. Pending results can remain unresolved until Gamma confirms finality.
 - Quote writes share the dedicated one-second writer, WAL database, and bounded queue. RTDS and CLOB batches commit in separate transactions. Ctrl+C stops discovery/collection, drains queued updates, and commits before closing SQLite.
@@ -78,6 +78,52 @@ FROM crypto_5m_resolutions r JOIN crypto_5m_markets m USING (market_id);
 SELECT t.outcome, x.timestamp_ms, x.price, x.size, x.side
 FROM btc_5m_trades x JOIN crypto_5m_tokens t USING (token_id)
 ORDER BY x.id DESC LIMIT 20;
+```
+
+## Console logs
+
+All application and SDK logs use UTC time, padded level/component columns, plain text, and a single stderr stream. Default filtering is `warn,a_bot=info`: compact batch summaries plus discovery/start/stop messages, with all warnings/errors visible.
+
+Batch columns: `batch` = queued records committed (not total SQL rows), `ref` = RTDS ticks, `quote` = best bid/ask, `book` = snapshots, `delta` = depth changes, `trade` = public ticks, `res` = resolution records, `evt` = collection telemetry, `ms` = full batch write time, `queue` = writer backlog at flush start. Counts include received records, including repeats; snapshots' individual levels are not counted as separate batch records.
+
+```sh
+# Show per-asset summaries, ingress queues, and application diagnostics:
+RUST_LOG=warn,a_bot=debug cargo run
+# Warnings/errors only:
+RUST_LOG=warn cargo run
+```
+
+## Pipeline architecture
+
+```text
+Gamma discovery + pending-result reconciliation (independent Tokio tasks)
+    -> per-asset subscription control
+    -> per-asset WebSocket ingestion task (one connection per asset)
+    -> bounded raw queue (8,192 messages per asset)
+    -> per-asset normalization/filtering task
+    -> shared bounded write queue (65,536 records)
+    -> one SQLite writer: bulk inserts, WAL transactions
+```
+
+Tokio's multi-thread runtime schedules the independent tasks across available cores (`TOKIO_WORKER_THREADS` can override its worker count). SQLite still has one writer; four pooled connections let discovery/reconciliation reads use WAL without waiting for that writer connection. The dedicated writer runtime keeps SQL orchestration off the ingestion workers.
+
+The sibling SDK now exposes `subscribe_market_events`: one unified stream per market instead of five typed receivers. Each asset has its own connection so a burst on BTC doesn't fill SOL's broadcast buffer. Subscriptions are incremental; adding/removing a market does not rebuild every asset's streams. The SDK reports recoverable `WsError::Lagged` errors to unified consumers; existing typed stream behavior is unchanged.
+
+Receipt times are captured at raw ingestion before processing/DB queue delays. Envelopes retain an immutable token-map snapshot so buffered events remain attributable after subscription rollover. Shutdown stops ingress, drains raw queues/processors, drains the writer, checkpoints WAL, and closes the pool. Worker failures propagate to the supervisor.
+
+Quotes, depth changes, trades, and snapshot levels use chunked multi-row inserts. Batches flush on a one-second timer or at 8,192 records, whichever comes first. Writer logs include the full batch's commit time and queue depth at flush start; debug-level ingress logs show raw queue occupancy every ten seconds.
+
+### Overload and coverage
+
+Memory is bounded by queue item counts, not a fixed byte budget (snapshots vary in size). Ingestion never waits on SQLite or a full processing queue. If a raw queue fills, the dropped envelope count is persisted in `collection_events`; this is explicit loss, not a lossless disk spool. SDK lag and stream errors are also persisted. After observed loss, only the affected market subscription is refreshed for a new snapshot once its raw queue has sufficient headroom; missing trades are not recoverable from that snapshot. There is still no guarantee of complete trade capture under unlimited load or disconnects.
+
+`collection_events` records session ID, asset, kind, observed Unix milliseconds, count, and detail. Kinds include `session_start`, `session_stop`, `ingress_overflow`, `sdk_lag`, `stream_error`, `connection_down`, `connection_up`, and `snapshot_refresh`. Connection state is sampled once a second; loss counters are reported periodically and drained at shutdown. These are observed reporting times, not exact missing-event boundaries. SDK lag counts are receiver observations and may overlap across market subscriptions; do not interpret their sum as unique missing trades. An unclean process kill may lose uncommitted data/counters and leave no `session_stop` marker.
+
+```sql
+SELECT session, asset, kind, at_ms, count, detail
+FROM collection_events
+WHERE kind IN ('ingress_overflow', 'sdk_lag', 'stream_error', 'connection_down')
+ORDER BY at_ms DESC;
 ```
 
 ```sh

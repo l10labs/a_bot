@@ -12,6 +12,8 @@ dependencies = [
  "polymarket_client_sdk_v2",
  "sqlx",
  "tokio",
+ "tokio-stream",
+ "tracing",
  "tracing-subscriber",
 ]
 

@@ -130,6 +130,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_inserts_cross_chunk_boundaries_without_losing_repeats() -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        crate::markets::initialize_schema(&pool).await?;
+        let t = token(Timeframe::M5);
+        let mut batch = Vec::new();
+        for _ in 0..225 {
+            let trade = LastTradePrice::builder()
+                .asset_id(t.token_id)
+                .market(polymarket_client_sdk_v2::types::B256::ZERO)
+                .timestamp(t.start_ms + 1)
+                .price("0.123456789".parse()?)
+                .size("3.5".parse()?)
+                .build();
+            batch.push(Write::MarketData(Record {
+                token: t.clone(),
+                received_ms: t.start_ms + 2,
+                data: Data::Trade(trade),
+            }));
+        }
+        crate::markets::store_batch(&pool, &batch).await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM btc_5m_trades WHERE price='0.123456789'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            225
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shutdown_flushes_market_records_and_restores_pending() -> anyhow::Result<()> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
         crate::markets::initialize_schema(&pool).await?;
@@ -312,9 +344,18 @@ pub async fn store(
             let book_id = sqlx::query(&format!("INSERT INTO {prefix}_books(token_id,timestamp_ms,received_ms,hash) VALUES (?,?,?,?)"))
                 .bind(id).bind(book.timestamp).bind(record.received_ms).bind(&book.hash).execute(&mut **tx).await?.last_insert_rowid();
             for (side, levels) in [("bid", &book.bids), ("ask", &book.asks)] {
-                for (level, value) in levels.iter().enumerate() {
-                    sqlx::query(&format!("INSERT INTO {prefix}_book_levels(book_id,side,level,price,size) VALUES (?,?,?,?,?)"))
-                        .bind(book_id).bind(side).bind(level as i64).bind(value.price.to_string()).bind(value.size.to_string()).execute(&mut **tx).await?;
+                for (chunk_index, chunk) in levels.chunks(150).enumerate() {
+                    let mut query = sqlx::QueryBuilder::<Sqlite>::new(format!(
+                        "INSERT INTO {prefix}_book_levels(book_id,side,level,price,size) "
+                    ));
+                    query.push_values(chunk.iter().enumerate(), |mut row, (index, value)| {
+                        row.push_bind(book_id)
+                            .push_bind(side)
+                            .push_bind((chunk_index * 150 + index) as i64)
+                            .push_bind(value.price.to_string())
+                            .push_bind(value.size.to_string());
+                    });
+                    query.build().execute(&mut **tx).await?;
                 }
             }
         }
@@ -345,6 +386,59 @@ pub async fn store(
                 .bind(id).bind(trade.timestamp).bind(record.received_ms).bind(trade.price.to_string()).bind(trade.size.map(|x| x.to_string()))
                 .bind(trade.side.map(|x| x.to_string())).bind(trade.fee_rate_bps.map(|x| x.to_string())).execute(&mut **tx).await?;
         }
+    }
+    Ok(())
+}
+
+/// Rows are already validated/grouped by asset, duration and event kind by the writer.
+pub async fn bulk_store(
+    tx: &mut Transaction<'_, Sqlite>,
+    records: &[&Record],
+) -> anyhow::Result<()> {
+    let Some(first) = records.first() else {
+        return Ok(());
+    };
+    let prefix = format!("{}_{}", first.token.asset, first.token.timeframe.name());
+    for chunk in records.chunks(100) {
+        let suffix = match first.data {
+            Data::Change { .. } => {
+                "book_changes(token_id,timestamp_ms,received_ms,side,price,size,hash,best_bid,best_ask)"
+            }
+            Data::Trade(_) => {
+                "trades(token_id,timestamp_ms,received_ms,price,size,side,fee_rate_bps)"
+            }
+            _ => anyhow::bail!("unsupported bulk event"),
+        };
+        let mut query =
+            sqlx::QueryBuilder::<Sqlite>::new(format!("INSERT INTO {prefix}_{suffix} "));
+        query.push_values(chunk.iter(), |mut row, record| {
+            row.push_bind(record.token.token_id.to_string());
+            match &record.data {
+                Data::Change {
+                    timestamp_ms,
+                    entry,
+                } => {
+                    row.push_bind(*timestamp_ms)
+                        .push_bind(record.received_ms)
+                        .push_bind(entry.side.to_string())
+                        .push_bind(entry.price.to_string())
+                        .push_bind(entry.size.map(|x| x.to_string()))
+                        .push_bind(entry.hash.as_deref())
+                        .push_bind(entry.best_bid.map(|x| x.to_string()))
+                        .push_bind(entry.best_ask.map(|x| x.to_string()));
+                }
+                Data::Trade(trade) => {
+                    row.push_bind(trade.timestamp)
+                        .push_bind(record.received_ms)
+                        .push_bind(trade.price.to_string())
+                        .push_bind(trade.size.map(|x| x.to_string()))
+                        .push_bind(trade.side.map(|x| x.to_string()))
+                        .push_bind(trade.fee_rate_bps.map(|x| x.to_string()));
+                }
+                _ => unreachable!("caller groups bulk events"),
+            }
+        });
+        query.build().execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -406,9 +500,9 @@ pub async fn reconcile(pool: SqlitePool, tx: mpsc::Sender<Write>) -> anyhow::Res
             let market = match gamma.market_by_id(&request).await {
                 Ok(market) => market,
                 Err(error) => {
-                    eprintln!(
-                        "Gamma resolution lookup {} failed: {error}",
-                        token.market_id
+                    crate::console::warn(
+                        "RESOLVE",
+                        format!("market={} lookup failed: {error}", token.market_id),
                     );
                     continue;
                 }

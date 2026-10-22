@@ -1,5 +1,7 @@
+mod console;
 mod market_data;
 mod markets;
+mod pipeline;
 
 use anyhow::Context;
 use futures::StreamExt as _;
@@ -15,6 +17,7 @@ enum Write {
     Price(ReceivedPrice),
     Quote(markets::Quote),
     MarketData(market_data::Record),
+    Collection(pipeline::Event),
 }
 
 fn now_ms() -> i64 {
@@ -135,12 +138,15 @@ async fn store_batch<T: std::borrow::Borrow<ReceivedPrice>>(
         .map(|((feed, symbol), count)| format!("{feed}:{symbol}={count}"))
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
-        "Wrote {} prices across {} assets in {} ms: {}",
-        batch.len(),
-        counts.len(),
-        started.elapsed().as_millis(),
-        assets
+    console::debug(
+        "RTDS",
+        format!(
+            "rows={} assets={} ms={} {}",
+            batch.len(),
+            counts.len(),
+            started.elapsed().as_millis(),
+            assets
+        ),
     );
     Ok(())
 }
@@ -154,7 +160,11 @@ async fn flush(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<()> {
         })
         .collect();
     store_batch(pool, &prices).await?;
-    if batch.iter().any(|write| !matches!(write, Write::Price(_))) {
+    pipeline::store(pool, batch).await?;
+    if batch
+        .iter()
+        .any(|write| matches!(write, Write::Quote(_) | Write::MarketData(_)))
+    {
         markets::store_batch(pool, batch).await?;
     }
     Ok(())
@@ -165,23 +175,69 @@ async fn writer(pool: SqlitePool, mut rx: mpsc::Receiver<Write>) -> anyhow::Resu
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut batch = Vec::new();
+    const MAX_BATCH: usize = 8192;
     loop {
         tokio::select! {
             // Prioritize the timer so a busy stream cannot starve commits.
             biased;
             _ = interval.tick() => {
-                flush(&pool, &batch).await?;
+                timed_flush(&pool, &batch, rx.len()).await?;
                 batch.clear();
             }
             update = rx.recv() => match update {
-                Some(update) => batch.push(update),
+                Some(update) => {
+                    batch.push(update);
+                    if batch.len() >= MAX_BATCH {
+                        timed_flush(&pool, &batch, rx.len()).await?;
+                        batch.clear();
+                    }
+                },
                 None => {
-                    flush(&pool, &batch).await?;
+                    timed_flush(&pool, &batch, 0).await?;
                     return Ok(());
                 }
             }
         }
     }
+}
+
+async fn timed_flush(pool: &SqlitePool, batch: &[Write], queued: usize) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let start = std::time::Instant::now();
+    flush(pool, batch).await?;
+    let (
+        mut reference,
+        mut quotes,
+        mut books,
+        mut changes,
+        mut trades,
+        mut resolutions,
+        mut events,
+    ) = (0, 0, 0, 0, 0, 0, 0);
+    for record in batch {
+        match record {
+            Write::Price(_) => reference += 1,
+            Write::Quote(_) => quotes += 1,
+            Write::MarketData(record) => match record.data {
+                market_data::Data::Book(_) => books += 1,
+                market_data::Data::Change { .. } => changes += 1,
+                market_data::Data::Trade(_) => trades += 1,
+                market_data::Data::Resolution { .. } => resolutions += 1,
+            },
+            Write::Collection(_) => events += 1,
+        }
+    }
+    console::info(
+        "WRITE",
+        format!(
+            "batch={:>6} ref={reference:>3} quote={quotes:>5} book={books:>3} delta={changes:>6} trade={trades:>4} res={resolutions:>2} evt={events:>2} ms={:>4} queue={queued:>5}",
+            batch.len(),
+            start.elapsed().as_millis()
+        ),
+    );
+    Ok(())
 }
 
 async fn checkpoint_wal(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -198,13 +254,18 @@ async fn checkpoint_wal(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+async fn main() -> std::process::ExitCode {
+    console::init();
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            console::error("FATAL", format!("{error:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://prices.db".into());
     let options = SqliteConnectOptions::from_str(&database_url)?
@@ -212,7 +273,7 @@ async fn main() -> anyhow::Result<()> {
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal);
     let pool = SqlitePoolOptions::new()
-        .max_connections(1)
+        .max_connections(4)
         .connect_with(options)
         .await
         .context("opening SQLite database")?;
@@ -220,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("initializing schema")?;
     markets::initialize_schema(&pool).await?;
+    pipeline::initialize_schema(&pool).await?;
 
     let client = Client::default();
     // None omits filters for both feeds. Keep source-native symbols unchanged.
@@ -243,21 +305,23 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     // Bounded queue provides backpressure instead of unbounded memory growth.
-    let (tx, rx) = mpsc::channel(16_384);
+    let (tx, rx) = mpsc::channel(65_536);
     let (market_shutdown, market_shutdown_rx) = watch::channel(false);
     let mut market_handle =
-        tokio::spawn(markets::run(tx.clone(), market_shutdown_rx, pool.clone()));
+        tokio::spawn(pipeline::run(tx.clone(), market_shutdown_rx, pool.clone()));
     let mut market_joined = false;
     let writer_pool = pool.clone();
-    // A dedicated blocking thread runs the async SQLx writer on its own runtime.
+    // Tokio's multi-thread runtime schedules independent ingestion/processing tasks
+    // across cores; SQLx runs SQLite's blocking work on its own connection threads.
     let mut writer_handle = tokio::task::spawn_blocking(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(writer(writer_pool, rx))
     });
-    eprintln!(
-        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m/15m/1h/4h quotes, depth, public trades, and resolutions into {database_url}; committing every second. Ctrl+C to stop."
+    console::info(
+        "START",
+        format!("db={database_url} | RTDS + CLOB 5m/15m/1h/4h | Ctrl+C to stop"),
     );
 
     let mut writer_joined = false;
@@ -267,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
                 biased;
                 signal = &mut shutdown => {
                     signal.context("listening for Ctrl+C")?;
-                    eprintln!("Shutdown requested; draining queued prices and flushing database writes...");
+                    console::info("STOP", "draining queues and flushing database");
                     return Ok(());
                 }
                 result = &mut market_handle => {
@@ -290,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
                         biased;
                         signal = &mut shutdown => {
                             signal.context("listening for Ctrl+C")?;
-                            eprintln!("Shutdown requested; draining queued prices and flushing database writes...");
+                            console::info("STOP", "draining queues and flushing database");
                             // Preserve this already-received tick even if the queue is full.
                             send.await.context("writer queue closed during shutdown")?;
                             return Ok(());
@@ -298,7 +362,7 @@ async fn main() -> anyhow::Result<()> {
                         result = &mut send => result.context("writer queue closed")?,
                     }
                 }
-                Some(Err(error)) => eprintln!("RTDS stream error: {error}"),
+                Some(Err(error)) => console::warn("RTDS", format!("stream error: {error}")),
                 None => anyhow::bail!("RTDS price stream ended unexpectedly"),
             }
         }
@@ -332,8 +396,9 @@ async fn main() -> anyhow::Result<()> {
     checkpoint_result?;
     result?;
     market_result?;
-    eprintln!(
-        "Shutdown complete: all queued prices committed, WAL checkpointed, and database closed."
+    console::info(
+        "STOP",
+        "complete | queues drained | WAL checkpointed | database closed",
     );
     Ok(())
 }
