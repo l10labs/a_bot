@@ -9,14 +9,42 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tokio::sync::mpsc;
 
+#[derive(Clone, Copy)]
+enum Feed {
+    Binance,
+    Chainlink,
+}
+
+impl Feed {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Binance => "binance",
+            Self::Chainlink => "chainlink",
+        }
+    }
+
+    fn insert_sql(self) -> &'static str {
+        match self {
+            Self::Binance => {
+                "INSERT INTO prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ?"
+            }
+            Self::Chainlink => {
+                "INSERT INTO chainlink_prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ?"
+            }
+        }
+    }
+}
+
 struct ReceivedPrice {
+    feed: Feed,
     price: CryptoPrice,
     received_ms: i64,
 }
 
 impl ReceivedPrice {
-    fn new(price: CryptoPrice) -> Self {
+    fn new(feed: Feed, price: CryptoPrice) -> Self {
         Self {
+            feed,
             price,
             received_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -39,7 +67,15 @@ async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             price TEXT NOT NULL,
             received_ms INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
         );
-        CREATE INDEX IF NOT EXISTS prices_asset_timestamp ON prices(asset_id, timestamp_ms);",
+        CREATE INDEX IF NOT EXISTS prices_asset_timestamp ON prices(asset_id, timestamp_ms);
+        CREATE TABLE IF NOT EXISTS chainlink_prices (
+            id INTEGER PRIMARY KEY,
+            asset_id INTEGER NOT NULL REFERENCES assets(id),
+            timestamp_ms INTEGER NOT NULL,
+            price TEXT NOT NULL,
+            received_ms INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
+        );
+        CREATE INDEX IF NOT EXISTS chainlink_prices_asset_timestamp ON chainlink_prices(asset_id, timestamp_ms);",
     )
     .execute(pool)
     .await?;
@@ -59,22 +95,21 @@ async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Resu
             .bind(&price.symbol)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "INSERT INTO prices (asset_id, timestamp_ms, price, received_ms) \
-             SELECT id, ?, ?, ? FROM assets WHERE symbol = ?",
-        )
-        .bind(price.timestamp)
-        .bind(price.value.to_string())
-        .bind(update.received_ms)
-        .bind(&price.symbol)
-        .execute(&mut *tx)
-        .await?;
-        *counts.entry(price.symbol.as_str()).or_insert(0usize) += 1;
+        sqlx::query(update.feed.insert_sql())
+            .bind(price.timestamp)
+            .bind(price.value.to_string())
+            .bind(update.received_ms)
+            .bind(&price.symbol)
+            .execute(&mut *tx)
+            .await?;
+        *counts
+            .entry((update.feed.name(), price.symbol.as_str()))
+            .or_insert(0usize) += 1;
     }
     tx.commit().await?;
     let assets = counts
         .iter()
-        .map(|(symbol, count)| format!("{symbol}={count}"))
+        .map(|((feed, symbol), count)| format!("{feed}:{symbol}={count}"))
         .collect::<Vec<_>>()
         .join(", ");
     println!(
@@ -129,8 +164,23 @@ async fn main() -> anyhow::Result<()> {
         .context("initializing schema")?;
 
     let client = Client::default();
-    // No symbol filters: receive every Binance asset offered by RTDS.
-    let stream = client.subscribe_crypto_prices(None)?;
+    // None omits filters for both feeds. Keep source-native symbols unchanged.
+    let binance = client
+        .subscribe_crypto_prices(None)?
+        .map(|update| update.map(|price| ReceivedPrice::new(Feed::Binance, price)));
+    let chainlink = client.subscribe_chainlink_prices(None)?.map(|update| {
+        update.map(|price| {
+            ReceivedPrice::new(
+                Feed::Chainlink,
+                CryptoPrice::builder()
+                    .symbol(price.symbol)
+                    .timestamp(price.timestamp)
+                    .value(price.value)
+                    .build(),
+            )
+        })
+    });
+    let stream = futures::stream::select(binance, chainlink);
     tokio::pin!(stream);
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -145,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             .block_on(writer(writer_pool, rx))
     });
     eprintln!(
-        "Streaming all RTDS Binance prices into {database_url}; committing every second. Ctrl+C to stop."
+        "Streaming all RTDS Binance and Chainlink prices into {database_url}; committing every second. Ctrl+C to stop."
     );
 
     let mut writer_joined = false;
@@ -164,8 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 update = stream.next() => update,
             };
             match update {
-                Some(Ok(price)) => {
-                    let update = ReceivedPrice::new(price);
+                Some(Ok(update)) => {
                     tx.send(update).await.context("writer queue closed")?;
                 }
                 Some(Err(error)) => eprintln!("RTDS stream error: {error}"),
@@ -208,6 +257,7 @@ mod tests {
         .into_iter()
         .map(|(symbol, timestamp, value)| {
             Ok(ReceivedPrice {
+                feed: Feed::Binance,
                 price: CryptoPrice::builder()
                     .symbol(symbol.to_owned())
                     .timestamp(timestamp)
@@ -240,6 +290,42 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(row, ("12345.123456789".into(), 1_700_000_000_123));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stores_both_feeds_without_mixing_history() -> anyhow::Result<()> {
+        let pool = database().await?;
+        let mut batch = updates()?;
+        let mut chainlink = ReceivedPrice::new(
+            Feed::Chainlink,
+            CryptoPrice::builder()
+                .symbol("btc/usd".to_owned())
+                .timestamp(2000)
+                .value("98765.123456789".parse()?)
+                .build(),
+        );
+        chainlink.received_ms = 1_700_000_000_456;
+        batch.push(chainlink);
+        store_batch(&pool, &batch).await?;
+        let row: (String, i64, String, i64) = sqlx::query_as(
+            "SELECT a.symbol, p.timestamp_ms, p.price, p.received_ms FROM chainlink_prices p JOIN assets a ON a.id = p.asset_id"
+        ).fetch_one(&pool).await?;
+        assert_eq!(
+            row,
+            (
+                "btc/usd".into(),
+                2000,
+                "98765.123456789".into(),
+                1_700_000_000_456
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM prices")
+                .fetch_one(&pool)
+                .await?,
+            3
+        );
         Ok(())
     }
 
