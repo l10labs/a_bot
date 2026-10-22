@@ -183,6 +183,19 @@ async fn writer(pool: SqlitePool, mut rx: mpsc::Receiver<Write>) -> anyhow::Resu
     }
 }
 
+async fn checkpoint_wal(pool: &SqlitePool) -> anyhow::Result<()> {
+    let (busy, remaining, checkpointed): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(pool)
+            .await
+            .context("checkpointing SQLite WAL")?;
+    anyhow::ensure!(
+        busy == 0,
+        "SQLite WAL checkpoint blocked by another connection (WAL pages: {remaining}, checkpointed: {checkpointed}); committed data remains safe in the WAL"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let database_url =
@@ -302,12 +315,18 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => Err(anyhow::Error::new(error).context("writer thread panicked")),
         }
     };
+    // No producers or writer remain: merge committed WAL pages into the main DB.
+    // Always close the pool, including when the checkpoint fails or is blocked.
+    let checkpoint_result = checkpoint_wal(&pool).await;
     pool.close().await;
-    // Never report a successful shutdown if the final commit failed.
+    // Never report a successful shutdown if the final commit or checkpoint failed.
     writer_result.context("persisting price batch during shutdown")?;
+    checkpoint_result?;
     result?;
     market_result?;
-    eprintln!("Shutdown complete: all queued prices committed and database closed.");
+    eprintln!(
+        "Shutdown complete: all queued prices committed, WAL checkpointed, and database closed."
+    );
     Ok(())
 }
 
@@ -402,6 +421,43 @@ mod tests {
                 .await?,
             3
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoints_and_truncates_file_wal() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "a_bot_checkpoint_{}_{}.db",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await?;
+        initialize_schema(&pool).await?;
+        store_batch(&pool, &updates()?).await?;
+        checkpoint_wal(&pool).await?;
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        if wal.exists() {
+            assert_eq!(std::fs::metadata(&wal)?.len(), 0);
+        }
+        pool.close().await;
+        let reopened =
+            SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path)).await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM binance_prices")
+                .fetch_one(&reopened)
+                .await?,
+            3
+        );
+        reopened.close().await;
+        std::fs::remove_file(path)?;
         Ok(())
     }
 
