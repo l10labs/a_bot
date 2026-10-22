@@ -205,20 +205,34 @@ async fn main() -> anyhow::Result<()> {
     let result = async {
         loop {
             let update = tokio::select! {
+                biased;
+                signal = &mut shutdown => {
+                    signal.context("listening for Ctrl+C")?;
+                    eprintln!("Shutdown requested; draining queued prices and flushing database writes...");
+                    return Ok(());
+                }
                 result = &mut writer_handle => {
                     writer_joined = true;
                     result.context("writer thread panicked")??;
                     anyhow::bail!("writer stopped unexpectedly");
                 }
-                signal = &mut shutdown => {
-                    signal.context("listening for Ctrl+C")?;
-                    return Ok(());
-                }
                 update = stream.next() => update,
             };
             match update {
                 Some(Ok(update)) => {
-                    tx.send(update).await.context("writer queue closed")?;
+                    let send = tx.send(update);
+                    tokio::pin!(send);
+                    tokio::select! {
+                        biased;
+                        signal = &mut shutdown => {
+                            signal.context("listening for Ctrl+C")?;
+                            eprintln!("Shutdown requested; draining queued prices and flushing database writes...");
+                            // Preserve this already-received tick even if the queue is full.
+                            send.await.context("writer queue closed during shutdown")?;
+                            return Ok(());
+                        }
+                        result = &mut send => result.context("writer queue closed")?,
+                    }
                 }
                 Some(Err(error)) => eprintln!("RTDS stream error: {error}"),
                 None => anyhow::bail!("RTDS price stream ended unexpectedly"),
@@ -231,11 +245,17 @@ async fn main() -> anyhow::Result<()> {
     let writer_result = if writer_joined {
         Ok(())
     } else {
-        writer_handle.await.context("writer thread panicked")?
+        match writer_handle.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::new(error).context("writer thread panicked")),
+        }
     };
     pool.close().await;
+    // Never report a successful shutdown if the final commit failed.
+    writer_result.context("persisting price batch during shutdown")?;
     result?;
-    writer_result.context("persisting price batch")
+    eprintln!("Shutdown complete: all queued prices committed and database closed.");
+    Ok(())
 }
 
 #[cfg(test)]
