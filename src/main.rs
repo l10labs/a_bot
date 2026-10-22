@@ -1,3 +1,5 @@
+mod markets;
+
 use anyhow::Context;
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::rtds::{Client, types::response::CryptoPrice};
@@ -6,7 +8,20 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+
+enum Write {
+    Price(ReceivedPrice),
+    Market(std::sync::Arc<markets::Token>),
+    Quote(markets::Quote),
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock precedes Unix epoch")
+        .as_millis() as i64
+}
 
 #[derive(Clone, Copy)]
 enum Feed {
@@ -83,7 +98,10 @@ async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Result<()> {
+async fn store_batch<T: std::borrow::Borrow<ReceivedPrice>>(
+    pool: &SqlitePool,
+    batch: &[T],
+) -> anyhow::Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -91,6 +109,7 @@ async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Resu
     let mut tx = pool.begin().await?;
     let mut counts = BTreeMap::new();
     for update in batch {
+        let update = update.borrow();
         let price = &update.price;
         sqlx::query("INSERT INTO assets (symbol, provider) VALUES (?, ?) ON CONFLICT(provider, symbol) DO NOTHING")
             .bind(&price.symbol)
@@ -125,7 +144,22 @@ async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Resu
     Ok(())
 }
 
-async fn writer(pool: SqlitePool, mut rx: mpsc::Receiver<ReceivedPrice>) -> anyhow::Result<()> {
+async fn flush(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<()> {
+    let prices: Vec<_> = batch
+        .iter()
+        .filter_map(|write| match write {
+            Write::Price(price) => Some(price),
+            _ => None,
+        })
+        .collect();
+    store_batch(pool, &prices).await?;
+    if batch.iter().any(|write| !matches!(write, Write::Price(_))) {
+        markets::store_batch(pool, batch).await?;
+    }
+    Ok(())
+}
+
+async fn writer(pool: SqlitePool, mut rx: mpsc::Receiver<Write>) -> anyhow::Result<()> {
     let period = Duration::from_secs(1);
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -135,13 +169,13 @@ async fn writer(pool: SqlitePool, mut rx: mpsc::Receiver<ReceivedPrice>) -> anyh
             // Prioritize the timer so a busy stream cannot starve commits.
             biased;
             _ = interval.tick() => {
-                store_batch(&pool, &batch).await?;
+                flush(&pool, &batch).await?;
                 batch.clear();
             }
             update = rx.recv() => match update {
                 Some(update) => batch.push(update),
                 None => {
-                    store_batch(&pool, &batch).await?;
+                    flush(&pool, &batch).await?;
                     return Ok(());
                 }
             }
@@ -165,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
     initialize_schema(&pool)
         .await
         .context("initializing schema")?;
+    markets::initialize_schema(&pool).await?;
 
     let client = Client::default();
     // None omits filters for both feeds. Keep source-native symbols unchanged.
@@ -189,6 +224,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(shutdown);
     // Bounded queue provides backpressure instead of unbounded memory growth.
     let (tx, rx) = mpsc::channel(16_384);
+    let (market_shutdown, market_shutdown_rx) = watch::channel(false);
+    let mut market_handle = tokio::spawn(markets::run(tx.clone(), market_shutdown_rx));
+    let mut market_joined = false;
     let writer_pool = pool.clone();
     // A dedicated blocking thread runs the async SQLx writer on its own runtime.
     let mut writer_handle = tokio::task::spawn_blocking(move || {
@@ -198,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
             .block_on(writer(writer_pool, rx))
     });
     eprintln!(
-        "Streaming all RTDS Binance and Chainlink prices into {database_url}; committing every second. Ctrl+C to stop."
+        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m Up/Down quotes into {database_url}; committing every second. Ctrl+C to stop."
     );
 
     let mut writer_joined = false;
@@ -211,6 +249,11 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Shutdown requested; draining queued prices and flushing database writes...");
                     return Ok(());
                 }
+                result = &mut market_handle => {
+                    market_joined = true;
+                    result.context("market collector panicked")??;
+                    anyhow::bail!("market collector stopped unexpectedly");
+                }
                 result = &mut writer_handle => {
                     writer_joined = true;
                     result.context("writer thread panicked")??;
@@ -220,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
             };
             match update {
                 Some(Ok(update)) => {
-                    let send = tx.send(update);
+                    let send = tx.send(Write::Price(update));
                     tokio::pin!(send);
                     tokio::select! {
                         biased;
@@ -240,6 +283,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     .await;
+    let _ = market_shutdown.send(true);
+    let market_result = if market_joined {
+        Ok(())
+    } else {
+        match market_handle.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::new(error).context("market collector panicked")),
+        }
+    };
     drop(tx);
     // Drain queued updates and flush the final partial batch before exiting.
     let writer_result = if writer_joined {
@@ -254,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
     // Never report a successful shutdown if the final commit failed.
     writer_result.context("persisting price batch during shutdown")?;
     result?;
+    market_result?;
     eprintln!("Shutdown complete: all queued prices committed and database closed.");
     Ok(())
 }
@@ -357,7 +410,7 @@ mod tests {
         let pool = database().await?;
         let (tx, rx) = mpsc::channel(10);
         for update in updates()? {
-            tx.send(update).await?;
+            tx.send(Write::Price(update)).await?;
         }
         drop(tx);
         writer(pool.clone(), rx).await?;

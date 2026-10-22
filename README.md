@@ -25,6 +25,33 @@ LIMIT 20;
 
 The SDK reconnects automatically, but this is a live feed, not a historical backfill: updates during disconnections or database stalls may be missed. RTDS determines available assets for each feed; these are not necessarily Binance's entire exchange listing. Binance uses `crypto_prices`/`update`; Chainlink uses `crypto_prices_chainlink`/`*`. Both subscriptions omit the filters field. Storage grows with price history; no retention policy is applied.
 
+## Crypto five-minute Up/Down markets
+
+`src/markets.rs` uses the SDK's Gamma and CLOB WebSocket clients (public; no credentials).
+
+- Every 30 seconds, paginates Gamma's open markets ending within the next 15 minutes, selecting source slugs matching `<asset>-updown-5m-<window-start-seconds>`.
+- Discovers assets dynamically, validates Up/Down outcomes, and maps each outcome to its Gamma token ID. Tracks current and upcoming windows, refreshes subscriptions as windows roll over, and ignores expired-window ticks.
+- Subscribes to `best_bid_ask` with the SDK's custom-feature flag. These are change events, not periodic snapshots; a quiet token may have no rows until its best prices change. No fabricated initial quotes or historical backfill.
+- Discovery runs separately from quote consumption, retries HTTP errors, and preserves subscriptions on discovery failures. The SDK handles WebSocket reconnects.
+- Quote writes share the dedicated one-second writer, WAL database, and bounded queue. RTDS and CLOB batches commit in separate transactions. Ctrl+C stops discovery/collection, drains queued updates, and commits before closing SQLite.
+
+Schema is created directly without migration files:
+
+- `crypto_5m_markets`: Gamma market ID, condition ID, slug, crypto asset, question, and window start/end in Unix milliseconds.
+- `crypto_5m_tokens`: decimal-text token ID, market foreign key, and `up`/`down` outcome.
+- `crypto_5m_quote_tables`: asset-to-table registry.
+- `crypto_5m_<asset>_quotes`: one table per discovered asset; token foreign key, `timestamp_ms`, `received_ms`, exact-decimal-text `best_bid` and `best_ask`, indexed by token/time. Both outcomes and successive windows are retained in the asset's table.
+
+Observed live assets: BTC, ETH, SOL, XRP, DOGE, BNB, HYPE, ZEC (availability may change).
+
+```sql
+SELECT m.slug, t.outcome, q.timestamp_ms, q.received_ms, q.best_bid, q.best_ask
+FROM crypto_5m_btc_quotes q
+JOIN crypto_5m_tokens t ON t.token_id = q.token_id
+JOIN crypto_5m_markets m ON m.market_id = t.market_id
+ORDER BY q.id DESC LIMIT 20;
+```
+
 ```sh
 cargo test
 ```
