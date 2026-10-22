@@ -1,3 +1,4 @@
+mod market_data;
 mod markets;
 
 use anyhow::Context;
@@ -13,6 +14,7 @@ use tokio::sync::{mpsc, watch};
 enum Write {
     Price(ReceivedPrice),
     Quote(markets::Quote),
+    MarketData(market_data::Record),
 }
 
 fn now_ms() -> i64 {
@@ -197,6 +199,12 @@ async fn checkpoint_wal(pool: &SqlitePool) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://prices.db".into());
     let options = SqliteConnectOptions::from_str(&database_url)?
@@ -237,7 +245,8 @@ async fn main() -> anyhow::Result<()> {
     // Bounded queue provides backpressure instead of unbounded memory growth.
     let (tx, rx) = mpsc::channel(16_384);
     let (market_shutdown, market_shutdown_rx) = watch::channel(false);
-    let mut market_handle = tokio::spawn(markets::run(tx.clone(), market_shutdown_rx));
+    let mut market_handle =
+        tokio::spawn(markets::run(tx.clone(), market_shutdown_rx, pool.clone()));
     let mut market_joined = false;
     let writer_pool = pool.clone();
     // A dedicated blocking thread runs the async SQLx writer on its own runtime.
@@ -248,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
             .block_on(writer(writer_pool, rx))
     });
     eprintln!(
-        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m/15m/1h/4h Up/Down quotes into {database_url}; committing every second. Ctrl+C to stop."
+        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m/15m/1h/4h quotes, depth, public trades, and resolutions into {database_url}; committing every second. Ctrl+C to stop."
     );
 
     let mut writer_joined = false;

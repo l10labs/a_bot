@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
-polymarket_client_sdk_v2 = { path = "../rs-clob-client-v2", features = ["rtds", "clob", "ws", "gamma"] }
+polymarket_client_sdk_v2 = { path = "../rs-clob-client-v2", features = ["rtds", "clob", "ws", "gamma", "tracing"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
