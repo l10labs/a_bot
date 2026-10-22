@@ -8,17 +8,17 @@ cargo run
 DATABASE_URL=sqlite://custom.db cargo run
 ```
 
-SQLite defaults to `prices.db` in the working directory. SQLx creates it and initializes the latest schema automatically (no migrations). Existing databases must already use the latest schema, including `received_ms`. Ctrl+C drains the bounded writer queue and commits the final partial batch before exiting. Receipt timestamps are captured when updates arrive, not at batch commit time. No credentials required. The sibling `../rs-clob-client-v2` SDK is a path dependency.
+SQLite defaults to `prices.db` in the working directory. SQLx creates it and initializes the latest schema automatically (no migrations). Existing databases must already use the latest schema, including `received_ms` and `assets.provider`. Ctrl+C drains the bounded writer queue and commits the final partial batch before exiting. Receipt timestamps are captured when updates arrive, not at batch commit time. No credentials required. The sibling `../rs-clob-client-v2` SDK is a path dependency.
 
-- `assets`: unique source-native symbols (e.g. Binance `btcusdt`, Chainlink `btc/usd`); no normalization or symbol filtering.
-- `prices`: Binance history.
+- `assets`: unique `(provider, symbol)` pairs, with provider `binance` or `chainlink` and source-native symbols (e.g. Binance `btcusdt`, Chainlink `btc/usd`); no normalization or symbol filtering.
+- `binance_prices`: Binance history.
 - `chainlink_prices`: Chainlink history (created automatically alongside existing Binance tables).
 
 Both history tables store every received update, linked to its asset, with source `timestamp_ms` and local `received_ms`, both Unix milliseconds. Prices are exact decimal TEXT, not floating point. Repeated ticks are retained.
 
 ```sql
 SELECT a.symbol, p.timestamp_ms, p.price
-FROM prices p JOIN assets a ON a.id = p.asset_id
+FROM binance_prices p JOIN assets a ON a.id = p.asset_id
 ORDER BY p.timestamp_ms DESC, p.id DESC
 LIMIT 20;
 ```

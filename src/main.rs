@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
-use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use anyhow::Context;
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::rtds::{Client, types::response::CryptoPrice};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy)]
@@ -26,10 +25,10 @@ impl Feed {
     fn insert_sql(self) -> &'static str {
         match self {
             Self::Binance => {
-                "INSERT INTO prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ?"
+                "INSERT INTO binance_prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ? AND provider = ?"
             }
             Self::Chainlink => {
-                "INSERT INTO chainlink_prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ?"
+                "INSERT INTO chainlink_prices (asset_id, timestamp_ms, price, received_ms) SELECT id, ?, ?, ? FROM assets WHERE symbol = ? AND provider = ?"
             }
         }
     }
@@ -58,16 +57,18 @@ async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS assets (
             id INTEGER PRIMARY KEY,
-            symbol TEXT NOT NULL UNIQUE
+            symbol TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK (provider IN ('binance', 'chainlink')),
+            UNIQUE(provider, symbol)
         );
-        CREATE TABLE IF NOT EXISTS prices (
+        CREATE TABLE IF NOT EXISTS binance_prices (
             id INTEGER PRIMARY KEY,
             asset_id INTEGER NOT NULL REFERENCES assets(id),
             timestamp_ms INTEGER NOT NULL,
             price TEXT NOT NULL,
             received_ms INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))
         );
-        CREATE INDEX IF NOT EXISTS prices_asset_timestamp ON prices(asset_id, timestamp_ms);
+        CREATE INDEX IF NOT EXISTS binance_prices_asset_timestamp ON binance_prices(asset_id, timestamp_ms);
         CREATE TABLE IF NOT EXISTS chainlink_prices (
             id INTEGER PRIMARY KEY,
             asset_id INTEGER NOT NULL REFERENCES assets(id),
@@ -91,8 +92,9 @@ async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Resu
     let mut counts = BTreeMap::new();
     for update in batch {
         let price = &update.price;
-        sqlx::query("INSERT INTO assets (symbol) VALUES (?) ON CONFLICT(symbol) DO NOTHING")
+        sqlx::query("INSERT INTO assets (symbol, provider) VALUES (?, ?) ON CONFLICT(provider, symbol) DO NOTHING")
             .bind(&price.symbol)
+            .bind(update.feed.name())
             .execute(&mut *tx)
             .await?;
         sqlx::query(update.feed.insert_sql())
@@ -100,6 +102,7 @@ async fn store_batch(pool: &SqlitePool, batch: &[ReceivedPrice]) -> anyhow::Resu
             .bind(price.value.to_string())
             .bind(update.received_ms)
             .bind(&price.symbol)
+            .bind(update.feed.name())
             .execute(&mut *tx)
             .await?;
         *counts
@@ -280,13 +283,13 @@ mod tests {
             2
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM prices")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM binance_prices")
                 .fetch_one(&pool)
                 .await?,
             3
         );
         let row: (String, i64) =
-            sqlx::query_as("SELECT price, received_ms FROM prices WHERE id = 1")
+            sqlx::query_as("SELECT price, received_ms FROM binance_prices WHERE id = 1")
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(row, ("12345.123456789".into(), 1_700_000_000_123));
@@ -321,7 +324,7 @@ mod tests {
             )
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM prices")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM binance_prices")
                 .fetch_one(&pool)
                 .await?,
             3
@@ -339,7 +342,7 @@ mod tests {
         drop(tx);
         writer(pool.clone(), rx).await?;
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM prices")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM binance_prices")
                 .fetch_one(&pool)
                 .await?,
             3
