@@ -16,7 +16,12 @@ use tokio::sync::{mpsc, watch};
 enum Write {
     Price(ReceivedPrice),
     Quote(markets::Quote),
-    MarketData(market_data::Record),
+    Trade(market_data::Trade),
+    Resolution(market_data::Resolution),
+    Market {
+        token: std::sync::Arc<markets::Token>,
+        received_ms: i64,
+    },
     Collection(pipeline::Event),
 }
 
@@ -161,10 +166,12 @@ async fn flush(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<()> {
         .collect();
     store_batch(pool, &prices).await?;
     pipeline::store(pool, batch).await?;
-    if batch
-        .iter()
-        .any(|write| matches!(write, Write::Quote(_) | Write::MarketData(_)))
-    {
+    if batch.iter().any(|write| {
+        matches!(
+            write,
+            Write::Quote(_) | Write::Trade(_) | Write::Resolution(_) | Write::Market { .. }
+        )
+    }) {
         markets::store_batch(pool, batch).await?;
     }
     Ok(())
@@ -207,32 +214,20 @@ async fn timed_flush(pool: &SqlitePool, batch: &[Write], queued: usize) -> anyho
     }
     let start = std::time::Instant::now();
     flush(pool, batch).await?;
-    let (
-        mut reference,
-        mut quotes,
-        mut books,
-        mut changes,
-        mut trades,
-        mut resolutions,
-        mut events,
-    ) = (0, 0, 0, 0, 0, 0, 0);
+    let (mut reference, mut quotes, mut trades, mut resolutions, mut events) = (0, 0, 0, 0, 0);
     for record in batch {
         match record {
             Write::Price(_) => reference += 1,
             Write::Quote(_) => quotes += 1,
-            Write::MarketData(record) => match record.data {
-                market_data::Data::Book(_) => books += 1,
-                market_data::Data::Change { .. } => changes += 1,
-                market_data::Data::Trade(_) => trades += 1,
-                market_data::Data::Resolution { .. } => resolutions += 1,
-            },
-            Write::Collection(_) => events += 1,
+            Write::Trade(_) => trades += 1,
+            Write::Resolution(_) => resolutions += 1,
+            Write::Collection(_) | Write::Market { .. } => events += 1,
         }
     }
     console::info(
         "WRITE",
         format!(
-            "batch={:>6} ref={reference:>3} quote={quotes:>5} book={books:>3} delta={changes:>6} trade={trades:>4} res={resolutions:>2} evt={events:>2} ms={:>4} queue={queued:>5}",
+            "batch={:>6} ref={reference:>3} quote={quotes:>5} trade={trades:>4} res={resolutions:>2} evt={events:>2} ms={:>4} queue={queued:>5}",
             batch.len(),
             start.elapsed().as_millis()
         ),
@@ -267,13 +262,13 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> anyhow::Result<()> {
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://prices.db".into());
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://min5-slim.db".into());
     let options = SqliteConnectOptions::from_str(&database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal);
     let pool = SqlitePoolOptions::new()
-        .max_connections(4)
+        .max_connections(2)
         .connect_with(options)
         .await
         .context("opening SQLite database")?;
@@ -321,7 +316,7 @@ async fn run() -> anyhow::Result<()> {
     });
     console::info(
         "START",
-        format!("db={database_url} | RTDS + CLOB 5m/15m/1h/4h | Ctrl+C to stop"),
+        format!("db={database_url} | RTDS + 5m quotes/trades/resolutions | Ctrl+C to stop"),
     );
 
     let mut writer_joined = false;

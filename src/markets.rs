@@ -1,59 +1,30 @@
-//! Gamma discovery and CLOB best-bid/ask collection for rolling crypto markets.
-use std::{collections::BTreeMap, sync::Arc};
-
+//! Discovery and batched persistence for five-minute Up/Down quotes and trades only.
+use crate::{Write, market_data::Trade};
 use anyhow::Context;
 use polymarket_client_sdk_v2::{
     gamma::{
-        Client as GammaClient,
+        Client,
         types::{request::MarketsRequest, response::Market},
     },
     types::U256,
 };
-use sqlx::SqlitePool;
-
-use crate::Write;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Timeframe {
-    M5,
-    M15,
-    H1,
-    H4,
-}
-
-impl Timeframe {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::M5 => "5m",
-            Self::M15 => "15m",
-            Self::H1 => "1h",
-            Self::H4 => "4h",
-        }
-    }
-    fn seconds(self) -> i64 {
-        match self {
-            Self::M5 => 300,
-            Self::M15 => 900,
-            Self::H1 => 3600,
-            Self::H4 => 14400,
-        }
-    }
-}
+use sqlx::{Sqlite, SqlitePool};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct Token {
     pub asset: String,
-    pub timeframe: Timeframe,
     pub market_id: String,
     pub condition_id: String,
     pub slug: String,
-    pub question: String,
     pub start_ms: i64,
     pub end_ms: i64,
     pub token_id: U256,
     pub outcome: String,
 }
-
 pub struct Quote {
     pub token: Arc<Token>,
     pub bid: String,
@@ -61,23 +32,12 @@ pub struct Quote {
     pub timestamp_ms: i64,
     pub received_ms: i64,
 }
-
 pub(crate) fn in_active_window(token: &Token, timestamp_ms: i64, received_ms: i64) -> bool {
     (token.start_ms..token.end_ms).contains(&timestamp_ms)
         && (token.start_ms..token.end_ms).contains(&received_ms)
 }
-
-fn slug_parts(slug: &str) -> Option<(&str, i64, Timeframe)> {
-    let (asset, suffix) = slug.split_once("-updown-")?;
-    let (frame, start) = suffix.split_once('-')?;
-    let timeframe = match frame {
-        "5m" => Timeframe::M5,
-        "15m" => Timeframe::M15,
-        "1h" => Timeframe::H1,
-        "4h" => Timeframe::H4,
-        _ => return None,
-    };
-    // Table identifiers come only from this strictly validated symbol.
+fn slug_parts(slug: &str) -> Option<(&str, i64)> {
+    let (asset, start) = slug.split_once("-updown-5m-")?;
     if asset.is_empty()
         || !asset
             .bytes()
@@ -86,60 +46,24 @@ fn slug_parts(slug: &str) -> Option<(&str, i64, Timeframe)> {
         return None;
     }
     let start: i64 = start.parse().ok()?;
-    // Four-hour windows are ET-aligned, not necessarily UTC-epoch 4h aligned.
-    (start > 0 && start % 300 == 0).then_some((asset, start, timeframe))
+    (start > 0 && start % 300 == 0).then_some((asset, start))
 }
-
-fn market_window(market: &Market) -> Option<(String, i64, i64, Timeframe)> {
-    let slug = market.slug.as_deref()?;
-    if let Some((asset, start, timeframe)) = slug_parts(slug) {
-        let start_ms = start.checked_mul(1000)?;
-        let end_ms = start_ms.checked_add(timeframe.seconds() * 1000)?;
-        if market
-            .end_date
-            .is_some_and(|end| end.timestamp_millis() != end_ms)
-            || market
-                .event_start_time
-                .is_some_and(|begin| begin.timestamp_millis() != start_ms)
-        {
-            return None;
-        }
-        return Some((asset.into(), start_ms, end_ms, timeframe));
-    }
-    let (name, _) = slug.split_once("-up-or-down-")?;
-    let start = market.event_start_time?;
-    let end = market.end_date?;
-    if end.timestamp_millis() - start.timestamp_millis() != 3_600_000 {
-        return None;
-    }
-    // Hourly crypto markets use Binance candles. Derive the asset from the pair,
-    // rather than maintaining a fixed list of supported cryptocurrencies.
-    let description = market.description.as_deref()?;
-    let prefix = description.split_once("/USDT")?.0;
-    let asset = prefix
-        .rsplit(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit())
-        .next()?;
-    if name.is_empty() || asset.is_empty() || !description.contains("Binance") {
-        return None;
-    }
-    Some((
-        asset.to_ascii_lowercase(),
-        start.timestamp_millis(),
-        end.timestamp_millis(),
-        Timeframe::H1,
-    ))
-}
-
 fn tokens(market: Market, now: i64) -> Option<Vec<Arc<Token>>> {
     let slug = market.slug.as_deref()?;
-    let (asset, start_ms, end_ms, timeframe) = market_window(&market)?;
-    if start_ms > now + 15 * 60 * 1000 {
-        return None;
-    }
+    let (asset, start) = slug_parts(slug)?;
+    let start_ms = start.checked_mul(1000)?;
+    let end_ms = start_ms.checked_add(300_000)?;
     if end_ms <= now
+        || start_ms > now + 900_000
         || market.closed == Some(true)
         || market.active == Some(false)
         || market.enable_order_book == Some(false)
+        || market
+            .end_date
+            .is_some_and(|t| t.timestamp_millis() != end_ms)
+        || market
+            .event_start_time
+            .is_some_and(|t| t.timestamp_millis() != start_ms)
     {
         return None;
     }
@@ -148,8 +72,8 @@ fn tokens(market: Market, now: i64) -> Option<Vec<Arc<Token>>> {
     if outcomes.len() != 2
         || ids.len() != 2
         || ids[0] == ids[1]
-        || !outcomes.iter().any(|s| s.eq_ignore_ascii_case("up"))
-        || !outcomes.iter().any(|s| s.eq_ignore_ascii_case("down"))
+        || !outcomes.iter().any(|o| o.eq_ignore_ascii_case("up"))
+        || !outcomes.iter().any(|o| o.eq_ignore_ascii_case("down"))
     {
         return None;
     }
@@ -160,13 +84,11 @@ fn tokens(market: Market, now: i64) -> Option<Vec<Arc<Token>>> {
             .zip(ids)
             .map(|(outcome, id)| {
                 Arc::new(Token {
-                    asset: asset.to_owned(),
+                    asset: asset.into(),
                     market_id: market.id.clone(),
                     condition_id: condition.to_string(),
-                    slug: slug.to_owned(),
-                    question: market.question.clone().unwrap_or_default(),
+                    slug: slug.into(),
                     start_ms,
-                    timeframe,
                     end_ms,
                     token_id: *id,
                     outcome: outcome.to_ascii_lowercase(),
@@ -175,8 +97,7 @@ fn tokens(market: Market, now: i64) -> Option<Vec<Arc<Token>>> {
             .collect(),
     )
 }
-
-pub(crate) async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U256, Arc<Token>>> {
+pub(crate) async fn discover(client: &Client) -> anyhow::Result<BTreeMap<U256, Arc<Token>>> {
     let now = chrono::Utc::now();
     let mut result = BTreeMap::new();
     let mut offset = 0;
@@ -184,8 +105,8 @@ pub(crate) async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U2
         let request = MarketsRequest::builder()
             .closed(false)
             .end_date_min(now)
-            .end_date_max(now + chrono::Duration::minutes(255))
-            .order("id".to_owned())
+            .end_date_max(now + chrono::Duration::minutes(15))
+            .order("id".into())
             .ascending(true)
             .limit(100)
             .offset(offset)
@@ -193,7 +114,7 @@ pub(crate) async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U2
         let page = client
             .markets(&request)
             .await
-            .context("querying Gamma markets")?;
+            .context("querying Gamma five-minute markets")?;
         let len = page.len();
         for market in page {
             if let Some(tokens) = tokens(market, now.timestamp_millis()) {
@@ -209,320 +130,212 @@ pub(crate) async fn discover(client: &GammaClient) -> anyhow::Result<BTreeMap<U2
     }
     Ok(result)
 }
-
 pub async fn initialize_schema(pool: &SqlitePool) -> anyhow::Result<()> {
-    for timeframe in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::H4] {
-        let frame = timeframe.name();
-        sqlx::raw_sql(&format!("CREATE TABLE IF NOT EXISTS crypto_{frame}_markets (
-        market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL, slug TEXT NOT NULL,
-        asset TEXT NOT NULL, question TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS markets (
+        market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+        asset TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+        CHECK(end_ms-start_ms=300000)
     );
-    CREATE TABLE IF NOT EXISTS crypto_{frame}_tokens (
-        token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES crypto_{frame}_markets(market_id),
-        outcome TEXT NOT NULL CHECK(outcome IN ('up','down'))
+    CREATE TABLE IF NOT EXISTS tokens (
+        token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(market_id),
+        outcome TEXT NOT NULL CHECK(outcome IN ('up','down')), UNIQUE(market_id,outcome)
     );
-    CREATE TABLE IF NOT EXISTS crypto_{frame}_quote_tables (
-        asset TEXT PRIMARY KEY, table_name TEXT NOT NULL UNIQUE
-    );")).execute(pool).await?;
-    }
-    crate::market_data::initialize_schema(pool).await?;
+    CREATE TABLE IF NOT EXISTS resolutions (
+        market_id TEXT PRIMARY KEY REFERENCES markets(market_id),
+        winning_token_id TEXT NOT NULL REFERENCES tokens(token_id),
+        winning_outcome TEXT NOT NULL CHECK(winning_outcome IN ('up','down')),
+        timestamp_ms INTEGER NOT NULL, received_ms INTEGER NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('clob_ws','gamma_finalized'))
+    );
+    CREATE INDEX IF NOT EXISTS markets_asset_start ON markets(asset,start_ms);",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
-
 pub async fn store_batch(pool: &SqlitePool, batch: &[Write]) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    let mut counts = BTreeMap::new();
-    let mut prepared_tokens = std::collections::BTreeSet::new();
-    let mut prepared_tables = std::collections::BTreeSet::new();
-    let mut prepared_data = std::collections::BTreeSet::new();
-    let mut quote_rows: BTreeMap<String, Vec<&Quote>> = BTreeMap::new();
-    let mut bulk_rows: BTreeMap<(String, &str), Vec<&crate::market_data::Record>> = BTreeMap::new();
+    let mut prepared_tokens = BTreeSet::new();
+    let mut prepared_assets = BTreeSet::new();
+    let mut quotes: BTreeMap<String, Vec<&Quote>> = BTreeMap::new();
+    let mut trades: BTreeMap<String, Vec<&Trade>> = BTreeMap::new();
     for write in batch {
-        let (token, quote, data) = match write {
-            Write::Quote(quote)
-                if in_active_window(&quote.token, quote.timestamp_ms, quote.received_ms) =>
-            {
-                (&quote.token, Some(quote), None)
+        let token = match write {
+            Write::Quote(q) if in_active_window(&q.token, q.timestamp_ms, q.received_ms) => {
+                &q.token
             }
-            Write::MarketData(record) if record.eligible() => (&record.token, None, Some(record)),
+            Write::Trade(t) if t.eligible() => &t.token,
+            Write::Resolution(r) if r.eligible() => &r.token,
+            Write::Market { token, received_ms }
+                if (token.start_ms..token.end_ms).contains(received_ms) =>
+            {
+                token
+            }
             _ => continue,
         };
-        // Validate again at the SQL boundary; identifiers cannot be bound as parameters.
         anyhow::ensure!(
-            !token.asset.is_empty()
-                && token
-                    .asset
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-            "invalid asset identifier"
+            slug_parts(&token.slug).map(|(a, s)| (a, s * 1000))
+                == Some((token.asset.as_str(), token.start_ms))
+                && token.end_ms - token.start_ms == 300_000,
+            "invalid five-minute market metadata"
         );
-        let frame = token.timeframe.name();
-        let table = format!("{}_{frame}_quotes", token.asset);
-        if prepared_tokens.insert((frame, token.token_id)) {
-            sqlx::query(&format!("INSERT INTO crypto_{frame}_markets (market_id, condition_id, slug, asset, question, start_ms, end_ms) VALUES (?,?,?,?,?,?,?) ON CONFLICT(market_id) DO NOTHING"))
-            .bind(&token.market_id).bind(&token.condition_id).bind(&token.slug).bind(&token.asset)
-            .bind(&token.question).bind(token.start_ms).bind(token.end_ms).execute(&mut *tx).await?;
-            sqlx::query(&format!("INSERT INTO crypto_{frame}_tokens (token_id,market_id,outcome) VALUES (?,?,?) ON CONFLICT(token_id) DO NOTHING"))
-            .bind(token.token_id.to_string()).bind(&token.market_id).bind(&token.outcome).execute(&mut *tx).await?;
+        if prepared_tokens.insert(token.token_id) {
+            sqlx::query("INSERT INTO markets(market_id,condition_id,slug,asset,start_ms,end_ms) VALUES (?,?,?,?,?,?) ON CONFLICT(market_id) DO NOTHING")
+                .bind(&token.market_id).bind(&token.condition_id).bind(&token.slug).bind(&token.asset).bind(token.start_ms).bind(token.end_ms).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO tokens(token_id,market_id,outcome) VALUES (?,?,?) ON CONFLICT(token_id) DO NOTHING")
+                .bind(token.token_id.to_string()).bind(&token.market_id).bind(&token.outcome).execute(&mut *tx).await?;
         }
-        if prepared_tables.insert(table.clone()) {
-            sqlx::query(&format!(
-            "CREATE TABLE IF NOT EXISTS {table} (
-            id INTEGER PRIMARY KEY, token_id TEXT NOT NULL REFERENCES crypto_{frame}_tokens(token_id),
-            timestamp_ms INTEGER NOT NULL, received_ms INTEGER NOT NULL,
-            best_bid TEXT NOT NULL, best_ask TEXT NOT NULL
-        )"
-        ))
-        .execute(&mut *tx)
-        .await?;
-            sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {table}_token_timestamp ON {table}(token_id,timestamp_ms)"
-        ))
-        .execute(&mut *tx)
-        .await?;
-            sqlx::query(&format!("INSERT INTO crypto_{frame}_quote_tables(asset,table_name) VALUES (?,?) ON CONFLICT(asset) DO NOTHING"))
-            .bind(&token.asset).bind(&table).execute(&mut *tx).await?;
+        if matches!(write, Write::Market { .. }) {
+            continue;
         }
-        if let Some(quote) = quote {
-            quote_rows.entry(table.clone()).or_default().push(quote);
-            *counts
-                .entry(format!("{}:{frame}", token.asset))
-                .or_insert(0usize) += 1;
+        if let Write::Resolution(result) = write {
+            sqlx::query("INSERT INTO resolutions(market_id,winning_token_id,winning_outcome,timestamp_ms,received_ms,source) VALUES (?,?,?,?,?,?) ON CONFLICT(market_id) DO NOTHING")
+                .bind(&token.market_id).bind(token.token_id.to_string()).bind(&token.outcome)
+                .bind(result.timestamp_ms).bind(result.received_ms).bind(&result.source).execute(&mut *tx).await?;
+            continue;
         }
-        if let Some(record) = data {
-            let kind = match record.data {
-                crate::market_data::Data::Book(_) => "books",
-                crate::market_data::Data::Change { .. } => "changes",
-                crate::market_data::Data::Trade(_) => "trades",
-                crate::market_data::Data::Resolution { .. } => "resolutions",
-            };
-            let initialize = prepared_data.insert((table.clone(), kind));
-            if !initialize
-                && matches!(
-                    record.data,
-                    crate::market_data::Data::Change { .. } | crate::market_data::Data::Trade(_)
-                )
-            {
-                bulk_rows
-                    .entry((table.clone(), kind))
-                    .or_default()
-                    .push(record);
-            } else {
-                crate::market_data::store(&mut tx, record, initialize).await?;
-            }
-            *counts
-                .entry(format!("{}:{frame}:{kind}", token.asset))
-                .or_insert(0usize) += 1;
+        if prepared_assets.insert(token.asset.clone()) {
+            let asset = &token.asset;
+            sqlx::raw_sql(&format!("CREATE TABLE IF NOT EXISTS \"{asset}_5m_quotes\" (
+                id INTEGER PRIMARY KEY,token_id TEXT NOT NULL REFERENCES tokens(token_id),timestamp_ms INTEGER NOT NULL,received_ms INTEGER NOT NULL,best_bid TEXT NOT NULL,best_ask TEXT NOT NULL
+            ); CREATE INDEX IF NOT EXISTS \"{asset}_5m_quotes_token_time\" ON \"{asset}_5m_quotes\"(token_id,timestamp_ms);
+            CREATE TABLE IF NOT EXISTS \"{asset}_5m_trades\" (
+                id INTEGER PRIMARY KEY,token_id TEXT NOT NULL REFERENCES tokens(token_id),timestamp_ms INTEGER NOT NULL,received_ms INTEGER NOT NULL,
+                price TEXT NOT NULL,size TEXT,side TEXT,fee_rate_bps TEXT
+            ); CREATE INDEX IF NOT EXISTS \"{asset}_5m_trades_token_time\" ON \"{asset}_5m_trades\"(token_id,timestamp_ms);")).execute(&mut *tx).await?;
+        }
+        match write {
+            Write::Quote(q) => quotes.entry(token.asset.clone()).or_default().push(q),
+            Write::Trade(t) => trades.entry(token.asset.clone()).or_default().push(t),
+            _ => unreachable!(),
         }
     }
-    for (table, rows) in quote_rows {
+    for (asset, rows) in quotes {
         for chunk in rows.chunks(150) {
-            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
-                "INSERT INTO {table}(token_id,timestamp_ms,received_ms,best_bid,best_ask) "
+            let mut query = sqlx::QueryBuilder::<Sqlite>::new(format!(
+                "INSERT INTO \"{asset}_5m_quotes\"(token_id,timestamp_ms,received_ms,best_bid,best_ask) "
             ));
-            query.push_values(chunk.iter(), |mut row, quote| {
-                row.push_bind(quote.token.token_id.to_string())
-                    .push_bind(quote.timestamp_ms)
-                    .push_bind(quote.received_ms)
-                    .push_bind(quote.bid.as_str())
-                    .push_bind(quote.ask.as_str());
+            query.push_values(chunk.iter(), |mut row, q| {
+                row.push_bind(q.token.token_id.to_string())
+                    .push_bind(q.timestamp_ms)
+                    .push_bind(q.received_ms)
+                    .push_bind(q.bid.as_str())
+                    .push_bind(q.ask.as_str());
             });
             query.build().execute(&mut *tx).await?;
         }
     }
-    for rows in bulk_rows.values() {
-        crate::market_data::bulk_store(&mut tx, rows).await?;
+    for (asset, rows) in trades {
+        crate::market_data::store_trades(&mut tx, &asset, &rows).await?;
     }
     tx.commit().await?;
-    if !counts.is_empty() {
-        crate::console::debug(
-            "CLOB",
-            format!(
-                "{}",
-                counts
-                    .iter()
-                    .map(|(asset, n)| format!("{asset}={n}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
-    }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    #[test]
-    fn validates_five_minute_slugs() {
-        assert_eq!(
-            slug_parts("btc-updown-5m-1800000000"),
-            Some(("btc", 1800000000, Timeframe::M5))
-        );
-        assert_eq!(
-            slug_parts("btc-updown-15m-1800000000").unwrap().2,
-            Timeframe::M15
-        );
-        assert!(slug_parts("btc;drop-updown-5m-1800000000").is_none());
+    pub(crate) fn token() -> Arc<Token> {
+        Arc::new(Token {
+            asset: "btc".into(),
+            market_id: "test".into(),
+            condition_id: polymarket_client_sdk_v2::types::B256::ZERO.to_string(),
+            slug: "btc-updown-5m-1800000000".into(),
+            start_ms: 1800000000000,
+            end_ms: 1800000300000,
+            token_id: U256::from(1),
+            outcome: "up".into(),
+        })
     }
     #[test]
-    fn maps_gamma_outcomes_by_position_and_rejects_expired_markets() {
+    fn accepts_only_five_minute_markets() {
+        assert!(slug_parts("btc-updown-5m-1800000000").is_some());
+        for slug in [
+            "btc-updown-15m-1800000000",
+            "btc-updown-4h-1800000000",
+            "bitcoin-up-or-down-october-22-2026-12am-et",
+            "btc;drop-updown-5m-1800000000",
+        ] {
+            assert!(slug_parts(slug).is_none());
+        }
         let market = Market::builder()
-            .id("test".to_owned())
-            .slug("btc-updown-5m-1800000000".to_owned())
+            .id("test".into())
+            .slug("btc-updown-5m-1800000000".into())
             .condition_id(polymarket_client_sdk_v2::types::B256::ZERO)
-            .outcomes(vec!["Down".to_owned(), "Up".to_owned()])
+            .outcomes(vec!["Down".into(), "Up".into()])
             .clob_token_ids(vec![U256::from(7), U256::from(8)])
             .build();
-        let found = tokens(market.clone(), 1_800_000_001_000).unwrap();
+        let found = tokens(market.clone(), 1800000000001).unwrap();
         assert_eq!(found[0].outcome, "down");
         assert_eq!(found[0].token_id, U256::from(7));
-        assert_eq!(found[1].outcome, "up");
-        let token = &found[0];
-        assert!(in_active_window(token, token.start_ms, token.start_ms));
-        assert!(in_active_window(token, token.end_ms - 1, token.end_ms - 1));
-        assert!(!in_active_window(token, token.start_ms - 1, token.start_ms));
-        assert!(!in_active_window(token, token.start_ms, token.start_ms - 1));
-        assert!(!in_active_window(token, token.end_ms, token.end_ms - 1));
-        assert!(!in_active_window(token, token.end_ms - 1, token.end_ms));
-        assert!(tokens(market, 1_800_000_300_000).is_none());
+        assert!(tokens(market, 1800000300000).is_none());
     }
-
     #[test]
-    fn recognizes_all_windows_and_hourly_event_start() {
-        for (name, frame) in [("15m", Timeframe::M15), ("4h", Timeframe::H4)] {
-            let market = Market::builder()
-                .id(name.to_owned())
-                .slug(format!("btc-updown-{name}-1800000000"))
-                .build();
-            let (_, start, end, actual) = market_window(&market).unwrap();
-            assert_eq!(actual, frame);
-            assert_eq!(end - start, frame.seconds() * 1000);
-        }
-        let begin = chrono::DateTime::from_timestamp(1800000000, 0).unwrap();
-        let market = Market::builder()
-            .id("hourly".to_owned())
-            .slug("bitcoin-up-or-down-january-15-2027-8am-et".to_owned())
-            .description("Binance BTC/USDT 1 hour candle".to_owned())
-            .start_date(begin - chrono::Duration::days(2))
-            .event_start_time(begin)
-            .end_date(begin + chrono::Duration::hours(1))
-            .build();
-        let (asset, start, end, frame) = market_window(&market).unwrap();
-        assert_eq!(asset, "btc");
-        assert_eq!(frame, Timeframe::H1);
-        assert_eq!(start, begin.timestamp_millis());
-        assert_eq!(end - start, 3_600_000);
+    fn active_window_is_start_inclusive_end_exclusive() {
+        let t = token();
+        assert!(in_active_window(&t, t.start_ms, t.start_ms));
+        assert!(!in_active_window(&t, t.start_ms - 1, t.start_ms));
+        assert!(!in_active_window(&t, t.start_ms, t.start_ms - 1));
+        assert!(!in_active_window(&t, t.end_ms, t.end_ms));
     }
-
     #[tokio::test]
-    async fn stores_all_timeframes_separately() -> anyhow::Result<()> {
+    async fn schema_contains_only_slim_market_tables() -> anyhow::Result<()> {
         let pool = SqlitePool::connect("sqlite::memory:").await?;
         initialize_schema(&pool).await?;
-        let mut batch = Vec::new();
-        for (id, frame) in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::H4]
-            .into_iter()
-            .enumerate()
-        {
-            let start = 1800000000000;
-            batch.push(Write::Quote(Quote {
-                token: Arc::new(Token {
-                    asset: "btc".into(),
-                    timeframe: frame,
-                    market_id: frame.name().into(),
-                    condition_id: "test".into(),
-                    slug: format!("btc-updown-{}-1800000000", frame.name()),
-                    question: "test".into(),
-                    start_ms: start,
-                    end_ms: start + frame.seconds() * 1000,
-                    token_id: U256::from(id + 1),
-                    outcome: "up".into(),
-                }),
-                bid: "0.41".into(),
-                ask: "0.59".into(),
-                timestamp_ms: start + 1,
-                received_ms: start + 2,
-            }));
-        }
-        store_batch(&pool, &batch).await?;
-        for frame in ["5m", "15m", "1h", "4h"] {
-            assert_eq!(
-                sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM btc_{frame}_quotes"))
-                    .fetch_one(&pool)
-                    .await?,
-                1
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stores_separate_asset_tables_and_outcomes() -> anyhow::Result<()> {
-        let pool = SqlitePool::connect("sqlite::memory:").await?;
-        initialize_schema(&pool).await?;
-        let mut batch = Vec::new();
-        for (asset, id, outcome) in [("btc", 1, "up"), ("btc", 2, "down"), ("eth", 3, "up")] {
-            batch.push(Write::Quote(Quote {
-                token: Arc::new(Token {
-                    asset: asset.into(),
-                    timeframe: Timeframe::M5,
-                    market_id: asset.into(),
-                    condition_id: "condition".into(),
-                    slug: format!("{asset}-updown-5m-1800000000"),
-                    question: "test".into(),
-                    start_ms: 1800000000000,
-                    end_ms: 1800000300000,
-                    token_id: U256::from(id),
-                    outcome: outcome.into(),
-                }),
+        let t = token();
+        store_batch(
+            &pool,
+            &[Write::Quote(Quote {
+                token: t.clone(),
                 bid: "0.123456789".into(),
                 ask: "0.55".into(),
-                timestamp_ms: 1800000000001,
-                received_ms: 1800000000002,
-            }));
-        }
-        store_batch(&pool, &batch).await?;
-        // Future-window quotes must not create even metadata/table-registry rows.
-        for write in &mut batch {
-            if let Write::Quote(quote) = write {
-                quote.timestamp_ms = quote.token.start_ms - 1;
-                quote.received_ms = quote.token.start_ms - 1;
-            }
-        }
-        let empty_pool = SqlitePool::connect("sqlite::memory:").await?;
-        initialize_schema(&empty_pool).await?;
-        store_batch(&empty_pool, &batch).await?;
+                timestamp_ms: t.start_ms + 1,
+                received_ms: t.start_ms + 2,
+            })],
+        )
+        .await?;
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(&pool)
+                .await?;
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM crypto_5m_markets")
-                .fetch_one(&empty_pool)
-                .await?,
-            0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM crypto_5m_quote_tables")
-                .fetch_one(&empty_pool)
-                .await?,
-            0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM btc_5m_quotes")
-                .fetch_one(&pool)
-                .await?,
-            2
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM eth_5m_quotes")
-                .fetch_one(&pool)
-                .await?,
-            1
-        );
-        let rows: Vec<(String,String)> = sqlx::query_as("SELECT t.outcome,q.best_bid FROM btc_5m_quotes q JOIN crypto_5m_tokens t USING(token_id) ORDER BY q.id").fetch_all(&pool).await?;
-        assert_eq!(
-            rows,
+            tables,
             vec![
-                ("up".into(), "0.123456789".into()),
-                ("down".into(), "0.123456789".into())
+                "btc_5m_quotes",
+                "btc_5m_trades",
+                "markets",
+                "resolutions",
+                "tokens"
             ]
+        );
+        let price: String = sqlx::query_scalar("SELECT best_bid FROM btc_5m_quotes")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(price, "0.123456789");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn future_quotes_do_not_create_metadata() -> anyhow::Result<()> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        initialize_schema(&pool).await?;
+        let t = token();
+        store_batch(
+            &pool,
+            &[Write::Quote(Quote {
+                token: t.clone(),
+                bid: "0.4".into(),
+                ask: "0.6".into(),
+                timestamp_ms: t.start_ms - 1,
+                received_ms: t.start_ms - 1,
+            })],
+        )
+        .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM markets")
+                .fetch_one(&pool)
+                .await?,
+            0
         );
         Ok(())
     }
