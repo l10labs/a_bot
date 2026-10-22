@@ -12,7 +12,6 @@ use tokio::sync::{mpsc, watch};
 
 enum Write {
     Price(ReceivedPrice),
-    Market(std::sync::Arc<markets::Token>),
     Quote(markets::Quote),
 }
 
@@ -249,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
             .block_on(writer(writer_pool, rx))
     });
     eprintln!(
-        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m Up/Down quotes into {database_url}; committing every second. Ctrl+C to stop."
+        "Streaming RTDS Binance/Chainlink prices and Gamma-discovered CLOB 5m/15m/1h/4h Up/Down quotes into {database_url}; committing every second. Ctrl+C to stop."
     );
 
     let mut writer_joined = false;
