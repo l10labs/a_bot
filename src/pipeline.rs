@@ -89,7 +89,6 @@ struct Envelope {
 #[derive(Default)]
 struct Stats {
     overflow: AtomicU64,
-    lag: AtomicU64,
     errors: AtomicU64,
     disconnects: AtomicU64,
     connections: AtomicU64,
@@ -124,7 +123,6 @@ async fn report(
 ) -> anyhow::Result<()> {
     for (kind, counter) in [
         ("ingress_overflow", &stats.overflow),
-        ("sdk_lag", &stats.lag),
         ("stream_error", &stats.errors),
         ("connection_down", &stats.disconnects),
         ("connection_up", &stats.connections),
@@ -249,6 +247,32 @@ async fn process(
     .context("writer closed")?;
     Ok(())
 }
+// Use only the SDK's public, unmodified typed subscriptions. Each typed stream
+// owns one SDK subscription reference; release all three when removing a market.
+fn subscribe_market(
+    ws: &Client,
+    ids: Vec<U256>,
+) -> anyhow::Result<BoxStream<'static, polymarket_client_sdk_v2::Result<WsMessage>>> {
+    let streams: Vec<BoxStream<'static, _>> = vec![
+        ws.subscribe_best_bid_ask(ids.clone())?
+            .map(|r| r.map(WsMessage::BestBidAsk))
+            .boxed(),
+        ws.subscribe_last_trade_price(ids.clone())?
+            .map(|r| r.map(WsMessage::LastTradePrice))
+            .boxed(),
+        ws.subscribe_market_resolutions(ids)?
+            .map(|r| r.map(WsMessage::MarketResolved))
+            .boxed(),
+    ];
+    Ok(futures::stream::select_all(streams).boxed())
+}
+fn unsubscribe_market(ws: &Client, ids: &[U256]) -> anyhow::Result<()> {
+    for _ in 0..3 {
+        ws.unsubscribe_prices(ids)?;
+    }
+    Ok(())
+}
+
 async fn ingest(
     mut control: watch::Receiver<Arc<Tokens>>,
     mut shutdown: watch::Receiver<bool>,
@@ -278,9 +302,9 @@ async fn ingest(
                 let mut groups:BTreeMap<String,Vec<U256>>=BTreeMap::new();
                 for token in tokens.values(){groups.entry(token.market_id.clone()).or_default().push(token.token_id);}
                 let removed:Vec<_>=subscriptions.keys().filter(|id|!groups.contains_key(*id)).cloned().collect();
-                for id in removed{streams.remove(&id);if let Some(ids)=subscriptions.remove(&id){ws.unsubscribe_prices(&ids)?;}}
+                for id in removed{streams.remove(&id);if let Some(ids)=subscriptions.remove(&id){unsubscribe_market(&ws,&ids)?;}}
                 for (id,ids) in groups {
-                    if !subscriptions.contains_key(&id){streams.insert(id.clone(),ws.subscribe_market_events(ids.clone())?.boxed());subscriptions.insert(id,ids);}
+                    if !subscriptions.contains_key(&id){streams.insert(id.clone(),subscribe_market(&ws,ids.clone())?);subscriptions.insert(id,ids);}
                 }
             },
             _=tick.tick()=>{
@@ -294,15 +318,15 @@ async fn ingest(
                 }
                 // Recover ended streams without rebuilding unrelated subscriptions.
                 let ended:Vec<_>=subscriptions.keys().filter(|id|!streams.contains_key(*id)).cloned().collect();
-                for id in ended{let ids=&subscriptions[&id];ws.unsubscribe_prices(ids)?;streams.insert(id,ws.subscribe_market_events(ids.clone())?.boxed());}
+                for id in ended{let ids=&subscriptions[&id];unsubscribe_market(&ws,ids)?;streams.insert(id,subscribe_market(&ws,ids.clone())?);}
             },
             event=streams.next(),if !streams.is_empty()=>if let Some((id,result))=event {
                 match result {
                     Ok(message)=>offer(&raw,&stats,Envelope{message,tokens:tokens.clone(),received_ms:now_ms()})?,
                     Err(error)=>{
-                        use std::error::Error as _;
-                        let missed=error.source().and_then(|e|e.downcast_ref::<polymarket_client_sdk_v2::ws::WsError>()).and_then(|e|match e{polymarket_client_sdk_v2::ws::WsError::Lagged(n)=>Some(*n),_=>None});
-                        if let Some(n)=missed{stats.lag.fetch_add(n,Ordering::Relaxed);}else{stats.errors.fetch_add(1,Ordering::Relaxed);}
+                        // SDK broadcast lag is logged internally, not returned by its
+                        // typed streams. Only actual returned errors are counted here.
+                        stats.errors.fetch_add(1,Ordering::Relaxed);
                         crate::console::debug("CLOB",format!("market={id} error={error}"));
                     }
                 }
@@ -451,7 +475,6 @@ mod tests {
         let t = markets::tests::token();
         let tokens = Arc::new([(t.token_id, t.clone())].into_iter().collect());
         let stats = Arc::new(Stats::default());
-        stats.lag.store(7, Ordering::Relaxed);
         let (raw_tx, raw_rx) = mpsc::channel(2);
         for _ in 0..3 {
             offer(

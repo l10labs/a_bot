@@ -19,7 +19,7 @@ DATABASE_URL=sqlite://custom-slim.db cargo run
 
 Defaults to `min5-slim.db` in the working directory. The full-data branch's `prices.db` is not modified. Schema is created directly at startup, without migration files. Use a fresh database: pointing this branch at an old database does not remove or migrate its existing tables/history.
 
-No credentials are required. The sibling `../rs-clob-client-v2` SDK is a path dependency, including its unified market-event API.
+No credentials are required. The bot uses the published `polymarket_client_sdk_v2` crate from crates.io, not a local path or patched SDK. The sibling `../rs-clob-client-v2` checkout is read-only reference material. It was added with `cargo add polymarket_client_sdk_v2 --registry crates-io --features rtds,clob,ws,gamma,tracing`.
 
 ## Discovery and timing
 
@@ -68,11 +68,13 @@ ORDER BY x.id DESC LIMIT 20;
 
 ## Pipeline and durability
 
-Independent Tokio tasks handle Gamma discovery, per-asset WebSocket ingestion, and per-asset filtering/normalization on the multi-thread runtime. One dedicated SQLite writer batches all persisted records every second, or earlier at 8,192 records, using chunked multi-row inserts. Raw queues hold up to 8,192 relevant messages per asset; the shared writer queue holds 65,536 records. SQLite uses WAL and two pooled connections so discovery/reconciliation can read pending results independently of the single database writer.
+Independent Tokio tasks handle Gamma discovery, per-asset WebSocket ingestion, and per-asset filtering/normalization on the multi-thread runtime. Each market uses the stock SDK's typed best-bid/ask, last-trade-price, and market-resolution subscriptions, merged by the bot. All three SDK subscription references are released together when a market is removed. No custom SDK APIs are required.
+
+One dedicated SQLite writer batches all persisted records every second, or earlier at 8,192 records, using chunked multi-row inserts. Raw queues hold up to 8,192 relevant messages per asset; the shared writer queue holds 65,536 records. SQLite uses WAL and two pooled connections so discovery/reconciliation can read pending results independently of the single database writer.
 
 Ctrl+C stops ingress, drains accepted raw records and writer queues, commits the final batch, verifies `PRAGMA wal_checkpoint(TRUNCATE)`, then closes SQLite. Never manually remove nonempty WAL files.
 
-Memory is bounded by item counts, not a fixed byte budget. A full raw queue drops new messages without blocking ingestion and records the loss in `collection_events`. SDK lag, connection changes, and session boundaries are also recorded. SDK lag counts may overlap across receivers and are not unique missing trades. Telemetry timestamps are observation times, not exact source gap boundaries.
+Memory is bounded by item counts, not a fixed byte budget. A full raw queue drops new messages without blocking ingestion and records the loss in `collection_events`. Returned stream errors, connection changes, and session boundaries are also recorded. The unmodified SDK logs broadcast-lag warnings internally but does not return them as typed-stream errors; those warnings remain visible in the console and are **not** automatically persisted as `sdk_lag` rows. Counts from multiple SDK receivers can overlap and are not unique missing trades. Telemetry timestamps are observation times, not exact source gap boundaries.
 
 Public `last_trade_price` messages lack reliable execution IDs for deduplication. Repeated received ticks are retained. Disconnects/lag can cause missing trades, and this branch does not backfill them. Final outcomes are retained in `resolutions`; unresolved markets remain pending until the WebSocket or Gamma confirms finality.
 
